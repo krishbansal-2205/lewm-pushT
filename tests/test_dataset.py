@@ -19,7 +19,7 @@ def mock_h5_path(tmp_path: Path) -> Path:
     """Create a small mock HDF5 dataset for testing."""
     h5_path = tmp_path / "test_pusht.h5"
     n_samples = 200
-    img_size = 96
+    img_size = 224
     action_dim = 2
 
     with h5py.File(h5_path, "w") as f:
@@ -55,9 +55,9 @@ class TestPushTDataset:
         assert "action" in sample
         assert "next_obs" in sample
 
-        assert sample["obs"].shape == (3, 96, 96), f"obs shape: {sample['obs'].shape}"
+        assert sample["obs"].shape == (3, 224, 224), f"obs shape: {sample['obs'].shape}"
         assert sample["action"].shape == (2,), f"action shape: {sample['action'].shape}"
-        assert sample["next_obs"].shape == (3, 96, 96), f"next_obs shape: {sample['next_obs'].shape}"
+        assert sample["next_obs"].shape == (3, 224, 224), f"next_obs shape: {sample['next_obs'].shape}"
 
     def test_getitem_dtypes(self, mock_h5_path: Path) -> None:
         """Test that returned tensors have correct dtypes."""
@@ -124,7 +124,7 @@ class TestPushTDataset:
         # Check train batch
         batch = next(iter(train_loader))
         assert batch["obs"].shape[0] == 16, f"Batch size should be 16, got {batch['obs'].shape[0]}"
-        assert batch["obs"].shape[1:] == (3, 96, 96)
+        assert batch["obs"].shape[1:] == (3, 224, 224)
 
     def test_train_val_split(self, mock_h5_path: Path) -> None:
         """Test that train/val split is correct."""

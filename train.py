@@ -76,7 +76,7 @@ def main() -> None:
         "predictor_hidden": [512, 512, 512],
         "dropout": 0.1,
         "action_dim": 2,
-        "image_size": 96,
+        "image_size": 224,
         "batch_size": 256,
         "epochs": 100,
         "lr": 3e-4,

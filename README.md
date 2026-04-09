@@ -37,7 +37,7 @@ A complete implementation of **LeWorldModel (LeWM)**, the JEPA-based world model
 pip install -r requirements.txt
 
 # 2. Download the PushT dataset (~12 GB compressed)
-python -m lewm_pusht.data.download
+python -m data.download
 
 # 3. Train LeWM (dry-run first)
 python train.py --config configs/pusht.yaml --epochs 2 --batch_size 32
@@ -50,10 +50,10 @@ python evaluate.py --checkpoint checkpoints/best.pt
 
 # 6. Generate visualizations
 python -c "
-from lewm_pusht.visualization.visualize import run_all_visualizations
+from visualization.visualize import run_all_visualizations
 from omegaconf import OmegaConf
 config = OmegaConf.load('configs/pusht.yaml')
-run_all_visualizations('checkpoints/best.pt', '~/.lewm_data/pusht/pusht_expert_train.h5', config)
+run_all_visualizations('checkpoints/best.pt', 'dataset/pusht_expert_train.h5', config)
 "
 ```
 
@@ -97,7 +97,6 @@ lewm_pusht/
 ## Running Tests
 
 ```bash
-cd lewm_pusht
 pytest tests/ -v
 ```
 

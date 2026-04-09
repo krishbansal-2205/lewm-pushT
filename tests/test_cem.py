@@ -17,7 +17,7 @@ def _make_model_and_config():
         "predictor_hidden": [128, 128],
         "dropout": 0.0,
         "action_dim": 2,
-        "image_size": 96,
+        "image_size": 224,
         "sigreg_num_projections": 16,
         "cem_n_samples": 32,
         "cem_top_k": 8,
@@ -39,8 +39,8 @@ class TestCEMPlanner:
         model, config = _make_model_and_config()
         planner = CEMPlanner(model, config)
 
-        obs = torch.randn(3, 96, 96)
-        goal_obs = torch.randn(3, 96, 96)
+        obs = torch.randn(3, 224, 224)
+        goal_obs = torch.randn(3, 224, 224)
 
         action = planner.plan(obs, goal_obs)
         assert isinstance(action, np.ndarray), "Action should be numpy array"
@@ -51,8 +51,8 @@ class TestCEMPlanner:
         model, config = _make_model_and_config()
         planner = CEMPlanner(model, config)
 
-        obs = torch.randn(3, 96, 96)
-        goal_obs = torch.randn(3, 96, 96)
+        obs = torch.randn(3, 224, 224)
+        goal_obs = torch.randn(3, 224, 224)
 
         action = planner.plan(obs, goal_obs)
         assert np.all(action >= -1.0), f"Action below lower bound: {action}"
@@ -63,8 +63,8 @@ class TestCEMPlanner:
         model, config = _make_model_and_config()
         planner = CEMPlanner(model, config)
 
-        obs = torch.randn(3, 96, 96)
-        goal_obs = torch.randn(3, 96, 96)
+        obs = torch.randn(3, 224, 224)
+        goal_obs = torch.randn(3, 224, 224)
 
         result = planner.plan_trajectory(obs, goal_obs, max_steps=5)
         assert "actions" in result
@@ -78,8 +78,8 @@ class TestCEMPlanner:
         model, config = _make_model_and_config()
         planner = CEMPlanner(model, config)
 
-        obs = torch.randn(3, 96, 96)
-        goal_obs = torch.randn(3, 96, 96)
+        obs = torch.randn(3, 224, 224)
+        goal_obs = torch.randn(3, 224, 224)
 
         torch.manual_seed(42)
         a1 = planner.plan(obs, goal_obs)
@@ -94,8 +94,8 @@ class TestCEMPlanner:
         model, config = _make_model_and_config()
         planner = CEMPlanner(model, config)
 
-        obs = torch.randn(3, 96, 96)
-        goal_obs = torch.randn(3, 96, 96)
+        obs = torch.randn(3, 224, 224)
+        goal_obs = torch.randn(3, 224, 224)
 
         action = planner.plan(obs, goal_obs)
         assert np.all(np.isfinite(action)), f"Action not finite: {action}"

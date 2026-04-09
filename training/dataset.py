@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import h5py
+import hdf5plugin
 import numpy as np
 import torch
+import torchvision.transforms.functional as TF
 from torch.utils.data import DataLoader, Dataset, Subset
 
 # ImageNet normalization constants
@@ -41,7 +43,7 @@ class PushTDataset(Dataset):
         self,
         h5_path: str | Path,
         augmentation: bool = True,
-        image_size: int = 96,
+        image_size: int = 224,
     ) -> None:
         self.h5_path = Path(h5_path)
         self.augmentation = augmentation
@@ -56,25 +58,21 @@ class PushTDataset(Dataset):
         # Open file to get dataset length and verify structure
         with h5py.File(self.h5_path, "r") as f:
             self._keys = list(f.keys())
-            # Detect key naming convention
-            if "observations" in f:
+            
+            if "pixels" in f:
+                self._obs_key = "pixels"
+            elif "observations" in f:
                 self._obs_key = "observations"
-                self._next_obs_key = "next_observations"
             elif "observation" in f:
                 self._obs_key = "observation"
-                self._next_obs_key = "next_observation"
             else:
-                # Try to find image-like keys
+                self._obs_key = None
                 for k in f.keys():
                     if "obs" in k.lower() and "next" not in k.lower():
                         self._obs_key = k
-                    elif "next" in k.lower() and "obs" in k.lower():
-                        self._next_obs_key = k
-                if not hasattr(self, "_obs_key"):
-                    raise KeyError(
-                        f"Cannot find observation keys in HDF5 file. "
-                        f"Available keys: {self._keys}"
-                    )
+                        break
+                if not self._obs_key:
+                    raise KeyError(f"Cannot find observation keys in HDF5 file. Keys: {self._keys}")
 
             if "actions" in f:
                 self._action_key = "actions"
@@ -83,9 +81,30 @@ class PushTDataset(Dataset):
             else:
                 raise KeyError(f"Cannot find action key. Keys: {self._keys}")
 
+            self._has_next_obs = False
+            for k in f.keys():
+                if "next" in k.lower() and "obs" in k.lower():
+                    self._next_obs_key = k
+                    self._has_next_obs = True
+            
+            # Setup valid indices correctly for episode-based datasets
             self._length = f[self._obs_key].shape[0]
-            self._obs_shape = f[self._obs_key].shape
-            self._action_shape = f[self._action_key].shape
+            if "ep_offset" in f and "ep_len" in f:
+                # LeRobot style dataset
+                ep_offsets = f["ep_offset"][:]
+                ep_lens = f["ep_len"][:]
+                valid_indices = []
+                for offset, length in zip(ep_offsets, ep_lens):
+                    if length > 1:
+                        # Exclude the last frame of each episode since it has no next_obs
+                        valid_indices.extend(range(offset, offset + length - 1))
+                self._valid_indices = np.array(valid_indices)
+            else:
+                # Assuming generic transitions or _has_next_obs is True
+                if self._has_next_obs:
+                     self._valid_indices = np.arange(self._length)
+                else:
+                     self._valid_indices = np.arange(self._length - 1)
 
         # h5py file handle for lazy loading (opened per-worker in DataLoader)
         self._h5_file: Optional[h5py.File] = None
@@ -97,7 +116,7 @@ class PushTDataset(Dataset):
         return self._h5_file
 
     def __len__(self) -> int:
-        return self._length
+        return len(self._valid_indices)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a single sample.
@@ -111,16 +130,25 @@ class PushTDataset(Dataset):
                 - 'next_obs_raw': Un-normalized next observation, (3, H, W).
         """
         h5 = self._get_h5()
+        real_idx = self._valid_indices[idx]
 
         # Load data from HDF5
-        obs = h5[self._obs_key][idx]           # (H, W, 3) uint8
-        action = h5[self._action_key][idx]     # (action_dim,) float32
-        next_obs = h5[self._next_obs_key][idx] # (H, W, 3) uint8
+        obs = h5[self._obs_key][real_idx]           # (H, W, 3) uint8
+        action = h5[self._action_key][real_idx]     # (action_dim,) float32
+        
+        if self._has_next_obs:
+            next_obs = h5[self._next_obs_key][real_idx] # (H, W, 3) uint8
+        else:
+            next_obs = h5[self._obs_key][real_idx + 1]
 
         # Convert to float tensors: HWC → CHW, [0, 255] → [0, 1]
         obs = torch.from_numpy(obs.astype(np.float32)).permute(2, 0, 1) / 255.0
         next_obs = torch.from_numpy(next_obs.astype(np.float32)).permute(2, 0, 1) / 255.0
         action = torch.from_numpy(action.astype(np.float32))
+
+        if obs.shape[-1] != self.image_size or obs.shape[-2] != self.image_size:
+            obs = TF.resize(obs, [self.image_size, self.image_size], antialias=True)
+            next_obs = TF.resize(next_obs, [self.image_size, self.image_size], antialias=True)
 
         # Store raw (un-normalized) copies for visualization
         obs_raw = obs.clone()
@@ -160,7 +188,7 @@ def get_dataloaders(
     train_split: float = 0.9,
     augmentation: bool = True,
     num_workers: int = 4,
-    image_size: int = 96,
+    image_size: int = 224,
     seed: int = 42,
 ) -> Tuple[DataLoader, DataLoader, PushTDataset]:
     """Create train and validation DataLoaders.

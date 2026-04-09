@@ -21,7 +21,7 @@ def get_data_dir() -> Path:
     Returns:
         Path to the data directory.
     """
-    default_dir = Path.home() / ".lewm_data" / "pusht"
+    default_dir = Path(__file__).parent.parent / "dataset"
     data_dir = Path(os.environ.get("LEWM_DATA_DIR", str(default_dir)))
     return data_dir
 
@@ -33,7 +33,7 @@ def download_pusht_dataset(data_dir: Path | None = None, force: bool = False) ->
     decompresses it to `pusht_expert_train.h5`.
 
     Args:
-        data_dir: Directory to save the dataset. Defaults to ~/.lewm_data/pusht.
+        data_dir: Directory to save the dataset. Defaults to dataset/.
         force: If True, re-download even if file exists.
 
     Returns:
@@ -128,7 +128,7 @@ def main() -> None:
         "--data-dir",
         type=str,
         default=None,
-        help="Directory to save the dataset (default: ~/.lewm_data/pusht)",
+        help="Directory to save the dataset (default: dataset/)",
     )
     parser.add_argument(
         "--force",

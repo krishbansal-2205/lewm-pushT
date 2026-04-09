@@ -4,8 +4,8 @@
 # All hyperparameters for training LeWorldModel on the PushT task.
 
 # ── Data ──────────────────────────────────────────────────
-data_dir: ~/.lewm_data/pusht
-image_size: 96
+data_dir: dataset
+image_size: 224
 train_split: 0.9
 augmentation: true
 num_workers: 4
