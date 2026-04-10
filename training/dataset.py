@@ -112,7 +112,8 @@ class PushTDataset(Dataset):
     def _get_h5(self) -> h5py.File:
         """Get or open the HDF5 file handle (thread-safe for DataLoader workers)."""
         if self._h5_file is None:
-            self._h5_file = h5py.File(self.h5_path, "r")
+        # Open with SWMR (Single Writer Multiple Reader) for faster concurrent reads
+            self._h5_file = h5py.File(self.h5_path, "r", swmr=True, libver='latest')
         return self._h5_file
 
     def __len__(self) -> int:
@@ -187,7 +188,7 @@ def get_dataloaders(
     batch_size: int = 256,
     train_split: float = 0.9,
     augmentation: bool = True,
-    num_workers: int = 4,
+    num_workers: int = 16,
     image_size: int = 224,
     seed: int = 42,
 ) -> Tuple[DataLoader, DataLoader, PushTDataset]:
@@ -239,6 +240,7 @@ def get_dataloaders(
         num_workers=num_workers,
         pin_memory=use_cuda,
         drop_last=True,
+        prefetch_factor=4,
         persistent_workers=num_workers > 0,
     )
 
@@ -249,6 +251,7 @@ def get_dataloaders(
         num_workers=num_workers,
         pin_memory=use_cuda,
         drop_last=False,
+        prefetch_factor=4,
         persistent_workers=num_workers > 0,
     )
 
