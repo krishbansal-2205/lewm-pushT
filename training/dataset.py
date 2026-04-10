@@ -146,9 +146,9 @@ class PushTDataset(Dataset):
             next_obs = h5[self._obs_key][real_idx + 1]
 
         # Convert to float tensors: HWC → CHW, [0, 255] → [0, 1]
-        obs = torch.from_numpy(obs.astype(np.float32)).permute(2, 0, 1) / 255.0
+        obs = torch.from_numpy(obs.astype(np.float32)).permute(2, 0, 1) 
         next_obs = torch.from_numpy(next_obs.astype(
-            np.float32)).permute(2, 0, 1) / 255.0
+            np.float32)).permute(2, 0, 1) 
         action = torch.from_numpy(action.astype(np.float32))
 
         # if obs.shape[-1] != self.image_size or obs.shape[-2] != self.image_size:

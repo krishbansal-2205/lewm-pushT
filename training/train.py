@@ -160,9 +160,9 @@ def train_lewm(
         pbar = tqdm(
             train_loader, desc=f"Epoch {epoch:3d}/{epochs}", leave=False)
         for batch in pbar:
-            obs = batch["obs"].to(device, non_blocking=True)
+            obs = batch["obs"].to(device, non_blocking=True).float()/255.0
             action = batch["action"].to(device, non_blocking=True)
-            next_obs = batch["next_obs"].to(device, non_blocking=True)
+            next_obs = batch["next_obs"].to(device, non_blocking=True).float()/255.0
 
             optimizer.zero_grad()
 
