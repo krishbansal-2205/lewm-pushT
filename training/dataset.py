@@ -58,7 +58,7 @@ class PushTDataset(Dataset):
         # Open file to get dataset length and verify structure
         with h5py.File(self.h5_path, "r") as f:
             self._keys = list(f.keys())
-            
+
             if "pixels" in f:
                 self._obs_key = "pixels"
             elif "observations" in f:
@@ -72,7 +72,8 @@ class PushTDataset(Dataset):
                         self._obs_key = k
                         break
                 if not self._obs_key:
-                    raise KeyError(f"Cannot find observation keys in HDF5 file. Keys: {self._keys}")
+                    raise KeyError(
+                        f"Cannot find observation keys in HDF5 file. Keys: {self._keys}")
 
             if "actions" in f:
                 self._action_key = "actions"
@@ -86,7 +87,7 @@ class PushTDataset(Dataset):
                 if "next" in k.lower() and "obs" in k.lower():
                     self._next_obs_key = k
                     self._has_next_obs = True
-            
+
             # Setup valid indices correctly for episode-based datasets
             self._length = f[self._obs_key].shape[0]
             if "ep_offset" in f and "ep_len" in f:
@@ -97,14 +98,15 @@ class PushTDataset(Dataset):
                 for offset, length in zip(ep_offsets, ep_lens):
                     if length > 1:
                         # Exclude the last frame of each episode since it has no next_obs
-                        valid_indices.extend(range(offset, offset + length - 1))
+                        valid_indices.extend(
+                            range(offset, offset + length - 1))
                 self._valid_indices = np.array(valid_indices)
             else:
                 # Assuming generic transitions or _has_next_obs is True
                 if self._has_next_obs:
-                     self._valid_indices = np.arange(self._length)
+                    self._valid_indices = np.arange(self._length)
                 else:
-                     self._valid_indices = np.arange(self._length - 1)
+                    self._valid_indices = np.arange(self._length - 1)
 
         # h5py file handle for lazy loading (opened per-worker in DataLoader)
         self._h5_file: Optional[h5py.File] = None
@@ -112,8 +114,9 @@ class PushTDataset(Dataset):
     def _get_h5(self) -> h5py.File:
         """Get or open the HDF5 file handle (thread-safe for DataLoader workers)."""
         if self._h5_file is None:
-        # Open with SWMR (Single Writer Multiple Reader) for faster concurrent reads
-            self._h5_file = h5py.File(self.h5_path, "r", swmr=True, libver='latest')
+            # Open with SWMR (Single Writer Multiple Reader) for faster concurrent reads
+            self._h5_file = h5py.File(self.h5_path, "r", swmr=True, libver='latest', rdcc_nbytes=1024**3,
+                                      rdcc_nslots=1e6)
         return self._h5_file
 
     def __len__(self) -> int:
@@ -136,20 +139,23 @@ class PushTDataset(Dataset):
         # Load data from HDF5
         obs = h5[self._obs_key][real_idx]           # (H, W, 3) uint8
         action = h5[self._action_key][real_idx]     # (action_dim,) float32
-        
+
         if self._has_next_obs:
-            next_obs = h5[self._next_obs_key][real_idx] # (H, W, 3) uint8
+            next_obs = h5[self._next_obs_key][real_idx]  # (H, W, 3) uint8
         else:
             next_obs = h5[self._obs_key][real_idx + 1]
 
         # Convert to float tensors: HWC → CHW, [0, 255] → [0, 1]
         obs = torch.from_numpy(obs.astype(np.float32)).permute(2, 0, 1) / 255.0
-        next_obs = torch.from_numpy(next_obs.astype(np.float32)).permute(2, 0, 1) / 255.0
+        next_obs = torch.from_numpy(next_obs.astype(
+            np.float32)).permute(2, 0, 1) / 255.0
         action = torch.from_numpy(action.astype(np.float32))
 
-        if obs.shape[-1] != self.image_size or obs.shape[-2] != self.image_size:
-            obs = TF.resize(obs, [self.image_size, self.image_size], antialias=True)
-            next_obs = TF.resize(next_obs, [self.image_size, self.image_size], antialias=True)
+        # if obs.shape[-1] != self.image_size or obs.shape[-2] != self.image_size:
+        #     obs = TF.resize(
+        #         obs, [self.image_size, self.image_size], antialias=True)
+        #     next_obs = TF.resize(
+        #         next_obs, [self.image_size, self.image_size], antialias=True)
 
         # Store raw (un-normalized) copies for visualization
         obs_raw = obs.clone()

@@ -157,11 +157,12 @@ def train_lewm(
         n_batches = 0
         t_start = time.time()
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{epochs}", leave=False)
+        pbar = tqdm(
+            train_loader, desc=f"Epoch {epoch:3d}/{epochs}", leave=False)
         for batch in pbar:
-            obs = batch["obs"].to(device)
-            action = batch["action"].to(device)
-            next_obs = batch["next_obs"].to(device)
+            obs = batch["obs"].to(device, non_blocking=True)
+            action = batch["action"].to(device, non_blocking=True)
+            next_obs = batch["next_obs"].to(device, non_blocking=True)
 
             optimizer.zero_grad()
 
@@ -241,8 +242,10 @@ def train_lewm(
 
         if latent_stats["mean_dim_std"] < 0.01:
             print(f"\n⚠ WARNING: Possible representation collapse detected!")
-            print(f"  Latent std = {latent_stats['mean_dim_std']:.6f} (threshold: 0.01)")
-            print(f"  Consider increasing lambda_reg (currently {lambda_reg})\n")
+            print(
+                f"  Latent std = {latent_stats['mean_dim_std']:.6f} (threshold: 0.01)")
+            print(
+                f"  Consider increasing lambda_reg (currently {lambda_reg})\n")
             # Auto-increase lambda_reg
             lambda_reg *= 2.0
             print(f"  Auto-increased lambda_reg to {lambda_reg}")
