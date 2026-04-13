@@ -1,24 +1,12 @@
 """
-Training loop for LeWM on PushT.
+Training loop for LeWM on PushT - GPU-optimized.
 
-Implements the full training pipeline:
-- CUDAPrefetcher: overlaps H→D transfer with GPU compute (fixes GPU sawtooth)
-- AdamW optimizer with cosine annealing LR schedule
-- Gradient clipping
-- Collapse detection via latent std monitoring
-- Best model checkpointing on validation loss
-- Early stopping
-
-FIXES applied vs original:
-  1. Removed `.float()/255.0` from both training and validation batch
-     fetches.  The dataset now returns properly normalised tensors (fixed
-     in dataset.py), so dividing by 255 here was a second normalisation
-     that pushed all values into a tiny ~0.004 range.
-  2. Added `non_blocking=True` to the validation `.to(device)` calls so
-     the PCIe transfer overlaps with the previous GPU kernel.
-  3. Added CUDAPrefetcher that uses a dedicated CUDA stream to upload the
-     next batch while the current batch is being processed — this is the
-     primary fix for the GPU utilisation sawtooth pattern.
+Key features:
+  1. NormalizeBatch runs on GPU (uint8->float+normalize)
+  2. CUDAPrefetcher overlaps H->D transfer with compute
+  3. Optional torch.compile for kernel fusion (PyTorch 2.x)
+  4. AMP mixed precision for throughput
+  5. Validation via torch.inference_mode
 """
 
 from __future__ import annotations
@@ -36,29 +24,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models.lewm import LeWM
+from training.dataset import NormalizeBatch
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CUDA Prefetcher — fixes the GPU utilisation sawtooth
-# ─────────────────────────────────────────────────────────────────────────────
 
 class CUDAPrefetcher:
-    """Overlaps host→device transfer with GPU computation.
-
-    On a standard DataLoader the sequence is:
-        [CPU decode] → [blocking H→D copy] → [GPU compute] → repeat
-
-    The GPU sits idle during the CPU decode and H→D copy phases, which
-    shows up as a sawtooth in nvidia-smi.  This prefetcher spawns a
-    dedicated CUDA stream that starts uploading batch N+1 while the GPU
-    is still computing batch N, so the PCIe transfer is hidden behind
-    the compute and utilisation stays near 100 %.
-
-    Usage (drop-in replacement for the DataLoader iterator):
-        prefetcher = CUDAPrefetcher(loader, device)
-        for batch in prefetcher:
-            loss = model(batch["obs"], ...)
-    """
+    """Overlaps host->device transfer with GPU compute via a side stream."""
 
     def __init__(self, loader: DataLoader, device: torch.device) -> None:
         self.loader = loader
@@ -68,8 +38,8 @@ class CUDAPrefetcher:
         self._batch: Optional[Dict[str, torch.Tensor]] = None
 
     def _preload(self) -> None:
-        assert self._iter is not None
         try:
+            assert self._iter is not None
             raw = next(self._iter)
         except StopIteration:
             self._batch = None
@@ -77,8 +47,7 @@ class CUDAPrefetcher:
 
         with torch.cuda.stream(self._stream):
             self._batch = {
-                k: v.to(self.device, non_blocking=True) if isinstance(
-                    v, torch.Tensor) else v
+                k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                 for k, v in raw.items()
             }
 
@@ -88,12 +57,10 @@ class CUDAPrefetcher:
         return self
 
     def __next__(self) -> Dict[str, torch.Tensor]:
-        # Wait for the pre-loaded batch to be ready on the device.
         torch.cuda.current_stream(self.device).wait_stream(self._stream)
         batch = self._batch
         if batch is None:
             raise StopIteration
-        # Kick off the next upload while the caller processes this batch.
         self._preload()
         return batch
 
@@ -101,54 +68,52 @@ class CUDAPrefetcher:
         return len(self.loader)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────────────────────────────────────
-
 def set_seed(seed: int) -> None:
-    """Set random seeds for reproducibility."""
+    """Set seeds and enable fast CUDA kernels."""
     import random
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 
 def compute_latent_stats(
     model: LeWM,
     loader: DataLoader,
     device: torch.device,
+    normalizer: Optional[NormalizeBatch],
     max_batches: int = 10,
 ) -> Dict[str, float]:
-    """Compute per-dimension std of latent vectors for collapse detection."""
+    """Compute latent stats for collapse monitoring."""
     model.eval()
     all_latents: list[torch.Tensor] = []
-    with torch.no_grad():
+
+    with torch.inference_mode():
         for i, batch in enumerate(loader):
             if i >= max_batches:
                 break
             obs = batch["obs"].to(device, non_blocking=True)
+            if normalizer is not None:
+                obs = normalizer(obs)
             z = model.encode(obs)
             all_latents.append(z.cpu())
 
-    all_latents_t = torch.cat(all_latents, dim=0)
-    dim_std = all_latents_t.std(dim=0)
-
+    cat = torch.cat(all_latents, dim=0)
+    dim_std = cat.std(dim=0)
     return {
-        "mean":         all_latents_t.mean().item(),
-        "std":          all_latents_t.std().item(),
-        "min_dim_std":  dim_std.min().item(),
-        "max_dim_std":  dim_std.max().item(),
+        "mean": cat.mean().item(),
+        "std": cat.std().item(),
+        "min_dim_std": dim_std.min().item(),
+        "max_dim_std": dim_std.max().item(),
         "mean_dim_std": dim_std.mean().item(),
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main training loop
-# ─────────────────────────────────────────────────────────────────────────────
 
 def train_lewm(
     model: LeWM,
@@ -157,113 +122,112 @@ def train_lewm(
     config: Any,
     device: torch.device,
     checkpoint_dir: Path,
+    normalizer: Optional[NormalizeBatch] = None,
 ) -> Dict[str, list]:
-    """Run the full LeWM training loop.
-
-    Args:
-        model:          LeWM model to train.
-        train_loader:   Training DataLoader.
-        val_loader:     Validation DataLoader.
-        config:         Training hyperparameters (OmegaConf or similar).
-        device:         Compute device.
-        checkpoint_dir: Directory to save checkpoints.
-
-    Returns:
-        Dict of training history (losses, metrics per epoch).
-    """
+    """Run the full LeWM training loop with GPU-optimized data path."""
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Hyperparameters
-    lr = getattr(config, "lr",                    3e-4)
-    weight_decay = getattr(config, "weight_decay",          1e-4)
-    grad_clip = getattr(config, "grad_clip",              1.0)
-    lambda_reg = getattr(config, "lambda_reg",             0.1)
-    epochs = getattr(config, "epochs",                 100)
-    log_every = getattr(config, "log_every",              100)
+    lr = getattr(config, "lr", 3e-4)
+    weight_decay = getattr(config, "weight_decay", 1e-4)
+    grad_clip = getattr(config, "grad_clip", 1.0)
+    lambda_reg = getattr(config, "lambda_reg", 0.1)
+    epochs = getattr(config, "epochs", 100)
+    log_every = getattr(config, "log_every", 100)
     patience = getattr(config, "early_stopping_patience", 20)
+    use_amp = getattr(config, "use_amp", True)
+    use_compile = getattr(config, "use_compile", True)
+
+    if normalizer is not None:
+        normalizer = normalizer.to(device)
+        if use_compile and hasattr(torch, "compile"):
+            try:
+                print("Compiling NormalizeBatch with torch.compile()...")
+                normalizer = torch.compile(normalizer, mode="reduce-overhead")
+                print("  ✓ NormalizeBatch compiled")
+            except Exception as e:
+                print(f"  ⚠ torch.compile failed for normalizer: {e}")
+
+    if use_compile and hasattr(torch, "compile"):
+        try:
+            print("Compiling LeWM with torch.compile()...")
+            model = torch.compile(model, mode="reduce-overhead")
+            print("  ✓ LeWM compiled")
+        except Exception as e:
+            print(f"  ⚠ torch.compile failed for model: {e}")
 
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     total_steps = len(train_loader) * epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp and torch.cuda.is_available())
 
     best_val_loss = float("inf")
-    epochs_without_improvement = 0
+    epochs_without_improve = 0
     global_step = 0
+    use_prefetcher = device.type == "cuda" and torch.cuda.is_available()
 
     history: Dict[str, list] = {
-        "train_loss":     [],
+        "train_loss": [],
         "train_pred_loss": [],
         "train_reg_loss": [],
-        "val_loss":       [],
-        "val_pred_loss":  [],
-        "val_reg_loss":   [],
-        "latent_std":     [],
-        "lr":             [],
+        "val_loss": [],
+        "val_pred_loss": [],
+        "val_reg_loss": [],
+        "latent_std": [],
+        "lr": [],
     }
-
-    use_prefetcher = torch.cuda.is_available()
 
     print("\n" + "=" * 60)
     print("Starting LeWM Training")
-    print(f"  Epochs:      {epochs}")
-    print(f"  Batch size:  {train_loader.batch_size}")
-    print(f"  LR:          {lr}")
-    print(f"  Lambda_reg:  {lambda_reg}")
-    print(f"  Device:      {device}")
-    print(
-        f"  Prefetcher:  {'enabled' if use_prefetcher else 'disabled (no CUDA)'}")
-    print(f"  Checkpoints: {checkpoint_dir}")
+    print(f"  Epochs:       {epochs}")
+    print(f"  Batch size:   {train_loader.batch_size}")
+    print(f"  LR:           {lr}")
+    print(f"  Lambda_reg:   {lambda_reg}")
+    print(f"  Device:       {device}")
+    print(f"  Mixed prec:   {use_amp}")
+    print(f"  Prefetcher:   {use_prefetcher}")
+    print(f"  Compile:      {use_compile}")
+    print(f"  Checkpoints:  {checkpoint_dir}")
     print("=" * 60 + "\n")
 
     for epoch in range(1, epochs + 1):
-
-        # ── Training ──────────────────────────────────────────────────────
         model.train()
         epoch_loss = epoch_pred = epoch_reg = 0.0
         n_batches = 0
         t_start = time.time()
 
-        # Wrap loader in CUDAPrefetcher when CUDA is available to keep
-        # the GPU fed without idle gaps between batches (fixes sawtooth).
-        train_iter = (
-            CUDAPrefetcher(train_loader, device) if use_prefetcher
-            else train_loader
-        )
-
-        pbar = tqdm(train_iter, desc=f"Epoch {epoch:3d}/{epochs}", leave=False,
-                    total=len(train_loader))
+        train_iter = CUDAPrefetcher(train_loader, device) if use_prefetcher else train_loader
+        pbar = tqdm(train_iter, desc=f"Epoch {epoch:3d}/{epochs}", leave=False, total=len(train_loader))
 
         for batch in pbar:
-            # FIX: do NOT divide by 255 here — dataset.py already produces
-            # correctly ImageNet-normalised float32 tensors.
             if use_prefetcher:
-                # Tensors already on device, courtesy of CUDAPrefetcher.
-                obs = batch["obs"]
-                action = batch["action"]
-                next_obs = batch["next_obs"]
+                obs_raw = batch["obs"]
+                act = batch["action"]
+                nxt_raw = batch["next_obs"]
             else:
-                obs = batch["obs"].to(device,      non_blocking=True)
-                action = batch["action"].to(device,   non_blocking=True)
-                next_obs = batch["next_obs"].to(device, non_blocking=True)
+                obs_raw = batch["obs"].to(device, non_blocking=True)
+                act = batch["action"].to(device, non_blocking=True)
+                nxt_raw = batch["next_obs"].to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            if normalizer is not None:
+                obs = normalizer(obs_raw)
+                next_obs = normalizer(nxt_raw)
+            else:
+                obs = obs_raw
+                next_obs = nxt_raw
 
-            try:
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(enabled=use_amp):
                 loss, pred_loss, reg_loss = model.compute_loss(
-                    obs, action, next_obs, lambda_reg=lambda_reg
+                    obs, act, next_obs, lambda_reg=lambda_reg
                 )
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    print("\n⚠ CUDA out of memory! Reduce batch_size in config.")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                raise
 
-            loss.backward()
-
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             epoch_loss += loss.item()
@@ -273,13 +237,12 @@ def train_lewm(
             global_step += 1
 
             if global_step % log_every == 0:
-                current_lr = scheduler.get_last_lr()[0]
                 pbar.set_postfix(
                     loss=f"{loss.item():.4f}",
                     pred=f"{pred_loss.item():.4f}",
                     reg=f"{reg_loss.item():.4f}",
                     gnorm=f"{grad_norm:.3f}",
-                    lr=f"{current_lr:.2e}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 )
 
         n_batches = max(n_batches, 1)
@@ -288,21 +251,27 @@ def train_lewm(
         epoch_reg /= n_batches
         epoch_time = time.time() - t_start
 
-        # ── Validation ────────────────────────────────────────────────────
         model.eval()
         val_loss = val_pred = val_reg = 0.0
         n_val = 0
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in val_loader:
-                # FIX: use non_blocking=True and NO /255.0 division.
-                obs = batch["obs"].to(device,      non_blocking=True)
-                action = batch["action"].to(device,   non_blocking=True)
-                next_obs = batch["next_obs"].to(device, non_blocking=True)
+                obs_raw = batch["obs"].to(device, non_blocking=True)
+                act = batch["action"].to(device, non_blocking=True)
+                nxt_raw = batch["next_obs"].to(device, non_blocking=True)
 
-                loss, pred_loss, reg_loss = model.compute_loss(
-                    obs, action, next_obs, lambda_reg=lambda_reg
-                )
+                if normalizer is not None:
+                    obs = normalizer(obs_raw)
+                    next_obs = normalizer(nxt_raw)
+                else:
+                    obs = obs_raw
+                    next_obs = nxt_raw
+
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    loss, pred_loss, reg_loss = model.compute_loss(
+                        obs, act, next_obs, lambda_reg=lambda_reg
+                    )
 
                 val_loss += loss.item()
                 val_pred += pred_loss.item()
@@ -314,19 +283,13 @@ def train_lewm(
         val_pred /= n_val
         val_reg /= n_val
 
-        # ── Collapse detection ────────────────────────────────────────────
-        latent_stats = compute_latent_stats(model, val_loader, device)
+        latent_stats = compute_latent_stats(model, val_loader, device, normalizer)
 
         if latent_stats["mean_dim_std"] < 0.01:
-            print(f"\n⚠ WARNING: Possible representation collapse detected!")
-            print(
-                f"  Latent std = {latent_stats['mean_dim_std']:.6f} (threshold: 0.01)")
-            print(
-                f"  Consider increasing lambda_reg (currently {lambda_reg})\n")
+            print(f"\n⚠ Collapse detected! Latent std={latent_stats['mean_dim_std']:.6f}")
             lambda_reg *= 2.0
-            print(f"  Auto-increased lambda_reg to {lambda_reg}")
+            print(f"  Auto-increased lambda_reg -> {lambda_reg}")
 
-        # ── Record history ────────────────────────────────────────────────
         current_lr = scheduler.get_last_lr()[0]
         history["train_loss"].append(epoch_loss)
         history["train_pred_loss"].append(epoch_pred)
@@ -346,33 +309,28 @@ def train_lewm(
             f"Time: {epoch_time:.1f}s"
         )
 
-        # ── Checkpointing ─────────────────────────────────────────────────
         if val_pred < best_val_loss:
             best_val_loss = val_pred
-            epochs_without_improvement = 0
-            best_path = checkpoint_dir / "best.pt"
-            model.save(best_path)
-            print(f"  ✓ New best model saved (val_pred={val_pred:.4f})")
+            epochs_without_improve = 0
+            raw_model = getattr(model, "_orig_mod", model)
+            raw_model.save(checkpoint_dir / "best.pt")
+            print(f"  ✓ Best model saved (val_pred={val_pred:.4f})")
         else:
-            epochs_without_improvement += 1
+            epochs_without_improve += 1
 
         if epoch % 10 == 0:
-            model.save(checkpoint_dir / f"pusht_lewm_epoch{epoch}.pt")
+            raw_model = getattr(model, "_orig_mod", model)
+            raw_model.save(checkpoint_dir / f"pusht_lewm_epoch{epoch}.pt")
 
-        # ── Early stopping ────────────────────────────────────────────────
-        if epochs_without_improvement >= patience:
-            print(f"\n⚡ Early stopping at epoch {epoch} "
-                  f"(no improvement for {patience} epochs)")
+        if epochs_without_improve >= patience:
+            print(f"\n⚡ Early stopping at epoch {epoch}")
             break
 
-    # Save final model + history
-    final_path = checkpoint_dir / "final.pt"
-    model.save(final_path)
-    print(f"\n✓ Training complete. Final model saved to {final_path}")
-    print(f"  Best val prediction loss: {best_val_loss:.4f}")
+    raw_model = getattr(model, "_orig_mod", model)
+    raw_model.save(checkpoint_dir / "final.pt")
 
     history_path = checkpoint_dir / "training_history.pt"
     torch.save(history, history_path)
-    print(f"  Training history saved to {history_path}")
+    print(f"\n✓ Training complete | Best val pred: {best_val_loss:.4f}")
 
     return history

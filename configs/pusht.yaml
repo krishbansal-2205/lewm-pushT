@@ -1,49 +1,51 @@
-# ════════════════════════════════════════════════════════════
-# LeWM PushT Configuration
-# ════════════════════════════════════════════════════════════
-# All hyperparameters for training LeWorldModel on the PushT task.
+# LeWM PushT Training Configuration - GPU-optimized
 
-# ── Data ──────────────────────────────────────────────────
+# Data
 data_dir: dataset
+cache_dir: dataset/cache
 image_size: 224
 train_split: 0.9
 augmentation: true
-num_workers: 16
+num_workers: 12
 
-# ── Model ─────────────────────────────────────────────────
+# Model
 latent_dim: 192
 encoder_channels: [32, 64, 128, 256]
 predictor_hidden: [512, 512, 512]
 dropout: 0.1
+action_dim: 2
 
-# ── Training ──────────────────────────────────────────────
-batch_size: 2048
+# Training
+batch_size: 512
 epochs: 100
 lr: 3e-4
 weight_decay: 1e-4
 grad_clip: 1.0
-lambda_reg: 0.1         # THE single LeWM hyperparameter
+lambda_reg: 0.1
 early_stopping_patience: 20
-checkpoint_dir: checkpoints/
+checkpoint_dir: checkpoints
 
-# ── SIGReg ────────────────────────────────────────────────
+# Performance
+use_amp: true
+use_compile: true
+
+# SIGReg
 sigreg_num_projections: 64
 
-# ── Planner (CEM) ────────────────────────────────────────
+# Planner
 cem_n_samples: 512
 cem_top_k: 64
 cem_n_iters: 5
 cem_horizon: 10
-action_dim: 2
 action_low: -1.0
 action_high: 1.0
 
-# ── Evaluation ────────────────────────────────────────────
+# Evaluation
 n_eval_episodes: 100
 max_steps_per_episode: 50
 success_threshold: 0.15
 
-# ── Misc ──────────────────────────────────────────────────
+# Misc
 seed: 42
-device: cuda             # auto-fallback to cpu if unavailable
-log_every: 25           # log every N training steps
+device: cuda
+log_every: 50
