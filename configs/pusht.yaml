@@ -8,7 +8,8 @@ data_dir: dataset
 image_size: 224
 train_split: 0.9
 augmentation: true
-num_workers: 16
+num_workers: 8
+cache_in_ram: true              # Cache all data in RAM (requires ~46 GB)
 
 # ── Model ─────────────────────────────────────────────────
 latent_dim: 192
@@ -22,9 +23,10 @@ epochs: 100
 lr: 3e-4
 weight_decay: 1e-4
 grad_clip: 1.0
-lambda_reg: 0.1         # THE single LeWM hyperparameter
+lambda_reg: 0.5               # Increased from 0.1 to prevent collapse
 early_stopping_patience: 20
 checkpoint_dir: checkpoints/
+use_amp: true                  # BF16 mixed precision (H100 tensor cores)
 
 # ── SIGReg ────────────────────────────────────────────────
 sigreg_num_projections: 64

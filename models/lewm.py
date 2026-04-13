@@ -64,7 +64,10 @@ class LeWM(nn.Module):
             hidden_dims=predictor_hidden,
             dropout=dropout,
         )
-        self.sigreg = SIGReg(num_projections=num_projections)
+        self.sigreg = SIGReg(
+            num_projections=num_projections,
+            latent_dim=latent_dim,
+        )
 
     def encode(self, obs: torch.Tensor) -> torch.Tensor:
         """Encode observations to latent vectors.

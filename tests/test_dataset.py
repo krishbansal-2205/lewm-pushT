@@ -43,12 +43,12 @@ class TestPushTDataset:
 
     def test_length(self, mock_h5_path: Path) -> None:
         """Test dataset reports correct length."""
-        dataset = PushTDataset(mock_h5_path, augmentation=False)
+        dataset = PushTDataset(mock_h5_path, augmentation=False, cache_in_ram=True)
         assert len(dataset) == 200, f"Expected 200, got {len(dataset)}"
 
     def test_getitem_shapes(self, mock_h5_path: Path) -> None:
         """Test that __getitem__ returns correct shapes."""
-        dataset = PushTDataset(mock_h5_path, augmentation=False)
+        dataset = PushTDataset(mock_h5_path, augmentation=False, cache_in_ram=True)
         sample = dataset[0]
 
         assert "obs" in sample
@@ -61,7 +61,7 @@ class TestPushTDataset:
 
     def test_getitem_dtypes(self, mock_h5_path: Path) -> None:
         """Test that returned tensors have correct dtypes."""
-        dataset = PushTDataset(mock_h5_path, augmentation=False)
+        dataset = PushTDataset(mock_h5_path, augmentation=False, cache_in_ram=True)
         sample = dataset[0]
 
         assert sample["obs"].dtype == torch.float32
@@ -70,7 +70,7 @@ class TestPushTDataset:
 
     def test_normalization(self, mock_h5_path: Path) -> None:
         """Test that images are normalized (not in [0, 255] range)."""
-        dataset = PushTDataset(mock_h5_path, augmentation=False)
+        dataset = PushTDataset(mock_h5_path, augmentation=False, cache_in_ram=True)
         sample = dataset[0]
 
         # After ImageNet normalization, values should be roughly in [-3, 3]
@@ -79,7 +79,7 @@ class TestPushTDataset:
 
     def test_raw_images_present(self, mock_h5_path: Path) -> None:
         """Test that raw (un-normalized) images are included."""
-        dataset = PushTDataset(mock_h5_path, augmentation=False)
+        dataset = PushTDataset(mock_h5_path, augmentation=False, cache_in_ram=True)
         sample = dataset[0]
 
         assert "obs_raw" in sample
@@ -90,8 +90,8 @@ class TestPushTDataset:
 
     def test_augmentation_flip(self, mock_h5_path: Path) -> None:
         """Test that augmentation produces different outputs."""
-        dataset_aug = PushTDataset(mock_h5_path, augmentation=True)
-        dataset_no = PushTDataset(mock_h5_path, augmentation=False)
+        dataset_aug = PushTDataset(mock_h5_path, augmentation=True, cache_in_ram=True)
+        dataset_no = PushTDataset(mock_h5_path, augmentation=False, cache_in_ram=True)
 
         # With random flips, at least some samples should differ
         # Check multiple samples
@@ -119,6 +119,7 @@ class TestPushTDataset:
             augmentation=True,
             num_workers=0,  # Use 0 workers for testing
             seed=42,
+            cache_in_ram=True,
         )
 
         # Check train batch
@@ -134,6 +135,7 @@ class TestPushTDataset:
             train_split=0.8,
             num_workers=0,
             seed=42,
+            cache_in_ram=True,
         )
 
         # 200 samples, 80% train = 160, 20% val = 40
@@ -142,3 +144,24 @@ class TestPushTDataset:
 
         assert train_samples == 160, f"Expected 160 train samples, got {train_samples}"
         assert val_samples == 40, f"Expected 40 val samples, got {val_samples}"
+
+    def test_lazy_loading_path(self, mock_h5_path: Path) -> None:
+        """Test that lazy loading (cache_in_ram=False) still works."""
+        dataset = PushTDataset(mock_h5_path, augmentation=False, cache_in_ram=False)
+        assert len(dataset) == 200
+        sample = dataset[0]
+        assert sample["obs"].shape == (3, 224, 224)
+        assert sample["obs_raw"].min() >= 0.0
+        assert sample["obs_raw"].max() <= 1.0
+
+    def test_cached_vs_lazy_identical(self, mock_h5_path: Path) -> None:
+        """Test that cached and lazy modes produce identical outputs."""
+        ds_cached = PushTDataset(mock_h5_path, augmentation=False, cache_in_ram=True)
+        ds_lazy = PushTDataset(mock_h5_path, augmentation=False, cache_in_ram=False)
+        
+        sample_c = ds_cached[0]
+        sample_l = ds_lazy[0]
+        
+        assert torch.allclose(sample_c["obs"], sample_l["obs"]), "Cached and lazy obs should match"
+        assert torch.allclose(sample_c["action"], sample_l["action"]), "Actions should match"
+        assert torch.allclose(sample_c["next_obs"], sample_l["next_obs"]), "next_obs should match"

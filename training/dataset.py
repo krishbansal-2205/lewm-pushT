@@ -1,8 +1,9 @@
 """
 PushT HDF5 dataset loader for LeWM training.
 
-Loads the PushT expert demonstrations from HDF5 file with lazy loading
-to minimize RAM usage. Provides train/val splits and data augmentation.
+Loads the PushT expert demonstrations from HDF5 file with optional RAM
+caching to eliminate the HDF5 random-I/O bottleneck that causes GPU
+utilization sawtooth patterns.
 
 The HDF5 file (from quentinll/lewm-pusht) contains:
   - pixels:      (N, H, W, 3) uint8 images
@@ -16,6 +17,9 @@ FIXES applied vs original:
      so they live in [0, 1] as the tests expect.
   3. SWMR open mode now falls back gracefully — the downloaded HDF5
      was not written with SWMR enabled and raised an OSError.
+  4. RAM caching: pixel + action arrays are loaded fully into memory on
+     init, so __getitem__ is a pure memory operation.  This eliminates
+     the HDF5 random-I/O bottleneck (primary cause of GPU sawtooth).
 """
 
 from __future__ import annotations
@@ -42,13 +46,22 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 class PushTDataset(Dataset):
     """PushT dataset from HDF5 file.
 
-    Loads observations, actions, and next observations with lazy loading
-    (only reads individual samples from disk on __getitem__).
+    Loads observations, actions, and next observations. Supports two modes:
+
+    1. **RAM-cached (default)**: Loads all pixel + action data into numpy
+       arrays at init time. __getitem__ does zero disk I/O — just array
+       indexing. Requires ~46 GB RAM for the full PushT dataset but
+       completely eliminates the HDF5 I/O bottleneck.
+
+    2. **Lazy-loading**: Reads individual samples from HDF5 on each
+       __getitem__. Uses much less RAM but is extremely slow for random
+       access on large files, causing GPU starvation (sawtooth).
 
     Args:
-        h5_path:    Path to the HDF5 file.
+        h5_path:      Path to the HDF5 file.
         augmentation: If True, apply random horizontal flips.
-        image_size: Expected image size (default: 224).
+        image_size:   Expected image size (default: 224).
+        cache_in_ram: If True, load all data into RAM at init (default: True).
     """
 
     def __init__(
@@ -56,10 +69,12 @@ class PushTDataset(Dataset):
         h5_path: str | Path,
         augmentation: bool = True,
         image_size: int = 224,
+        cache_in_ram: bool = True,
     ) -> None:
         self.h5_path = Path(h5_path)
         self.augmentation = augmentation
         self.image_size = image_size
+        self._cache_in_ram = cache_in_ram
 
         if not self.h5_path.exists():
             raise FileNotFoundError(
@@ -67,7 +82,7 @@ class PushTDataset(Dataset):
                 f"Download it with: python -m data.download"
             )
 
-        # Open file once to read metadata, then close.
+        # Open file once to read metadata + optionally cache data.
         with h5py.File(self.h5_path, "r") as f:
             self._keys = list(f.keys())
 
@@ -126,11 +141,29 @@ class PushTDataset(Dataset):
                     self._valid_indices = np.arange(
                         self._length - 1, dtype=np.int64)
 
-        # File handle opened lazily per DataLoader worker.
+            # ── RAM cache ────────────────────────────────────
+            if cache_in_ram:
+                print(f"  Caching dataset in RAM ({self._length} frames)...")
+                # Keep pixels as uint8 to save 4× RAM (~46 GB vs ~184 GB).
+                # float32 conversion + /255 happens in __getitem__.
+                self._pixels_cache = f[self._obs_key][:]       # (N, H, W, 3) uint8
+                self._action_cache = f[self._action_key][:]    # (N, action_dim) float32
+                if self._has_next_obs:
+                    self._next_obs_cache = f[self._next_obs_key][:]
+                else:
+                    self._next_obs_cache = None
+                print(f"  Cached: pixels={self._pixels_cache.nbytes / 1e9:.1f} GB, "
+                      f"actions={self._action_cache.nbytes / 1e6:.1f} MB")
+            else:
+                self._pixels_cache = None
+                self._action_cache = None
+                self._next_obs_cache = None
+
+        # File handle opened lazily per DataLoader worker (only for non-cached mode).
         self._h5_file: Optional[h5py.File] = None
 
     # ──────────────────────────────────────────────────────────────────────
-    # HDF5 handle (lazy, per-worker)
+    # HDF5 handle (lazy, per-worker) — only used when cache_in_ram=False
     # ──────────────────────────────────────────────────────────────────────
 
     def _get_h5(self) -> h5py.File:
@@ -180,17 +213,27 @@ class PushTDataset(Dataset):
             obs_raw    : un-normalised [0, 1] float32 tensor, shape (3, H, W).
             next_obs_raw: un-normalised [0, 1] float32 tensor, shape (3, H, W).
         """
-        h5 = self._get_h5()
         real_idx = int(self._valid_indices[idx])
 
-        # ── Load raw arrays from HDF5 ────────────────────────
-        obs_np = h5[self._obs_key][real_idx]        # (H, W, 3) uint8
-        act_np = h5[self._action_key][real_idx]     # (action_dim,) float32
+        if self._pixels_cache is not None:
+            # ── Fast path: read from RAM cache ────────────────
+            obs_np = self._pixels_cache[real_idx]        # (H, W, 3) uint8
+            act_np = self._action_cache[real_idx]        # (action_dim,) float32
 
-        if self._has_next_obs:
-            nxt_np = h5[self._next_obs_key][real_idx]
+            if self._next_obs_cache is not None:
+                nxt_np = self._next_obs_cache[real_idx]
+            else:
+                nxt_np = self._pixels_cache[real_idx + 1]
         else:
-            nxt_np = h5[self._obs_key][real_idx + 1]
+            # ── Slow path: read from HDF5 ─────────────────────
+            h5 = self._get_h5()
+            obs_np = h5[self._obs_key][real_idx]         # (H, W, 3) uint8
+            act_np = h5[self._action_key][real_idx]      # (action_dim,) float32
+
+            if self._has_next_obs:
+                nxt_np = h5[self._next_obs_key][real_idx]
+            else:
+                nxt_np = h5[self._obs_key][real_idx + 1]
 
         # ── uint8 → float32, HWC → CHW, scale to [0, 1] ─────
         # FIX: divide by 255 here so ImageNet mean/std (designed for [0,1])
@@ -247,6 +290,7 @@ def get_dataloaders(
     num_workers: int = 8,
     image_size: int = 224,
     seed: int = 42,
+    cache_in_ram: bool = True,
 ) -> Tuple[DataLoader, DataLoader, "PushTDataset"]:
     """Create train and validation DataLoaders.
 
@@ -258,12 +302,14 @@ def get_dataloaders(
         num_workers:  DataLoader worker count (default: 8).
         image_size:   Expected image size (default: 224).
         seed:         Random seed for reproducible splits (default: 42).
+        cache_in_ram: Cache all data in RAM for fast loading (default: True).
 
     Returns:
         Tuple of (train_loader, val_loader, full_dataset).
     """
     full_dataset = PushTDataset(
-        h5_path=h5_path, augmentation=False, image_size=image_size)
+        h5_path=h5_path, augmentation=False, image_size=image_size,
+        cache_in_ram=cache_in_ram)
     n = len(full_dataset)
     n_train = int(n * train_split)
 
@@ -273,11 +319,15 @@ def get_dataloaders(
     val_indices = indices[n_train:].tolist()
 
     train_dataset = PushTDataset(
-        h5_path=h5_path, augmentation=augmentation, image_size=image_size)
+        h5_path=h5_path, augmentation=augmentation, image_size=image_size,
+        cache_in_ram=cache_in_ram)
     train_subset = Subset(train_dataset, train_indices)
     val_subset = Subset(full_dataset,  val_indices)
 
     use_cuda = torch.cuda.is_available()
+
+    # With RAM-cached data, workers just do numpy indexing + torch ops.
+    # Fewer workers needed, and persistent_workers avoid re-caching.
     worker_kwargs = dict(
         num_workers=num_workers,
         pin_memory=use_cuda,
@@ -306,5 +356,6 @@ def get_dataloaders(
     print(f"  Val:   {len(val_indices)} samples ({n - n_train} / {n})")
     print(f"  Batch size: {batch_size}")
     print(f"  Augmentation: {augmentation}")
+    print(f"  RAM cache: {'enabled' if cache_in_ram else 'disabled'}")
 
     return train_loader, val_loader, full_dataset

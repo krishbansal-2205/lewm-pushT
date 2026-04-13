@@ -201,8 +201,9 @@ def create_planning_rollout_gif(
             frames.append(buf.copy())
             plt.close()
 
-            # Plan and step
-            action = planner.plan(obs, goal_obs)
+            # FIX: pass the current evolved latent so CEM plans from the
+            # correct starting state, not always from encode(original obs).
+            action = planner.plan(obs, goal_obs, z_curr=s_curr, z_goal=s_goal)
             action_t = torch.from_numpy(action).float().unsqueeze(0).to(device)
             with torch.no_grad():
                 s_curr = model.predictor.predict(s_curr, action_t)
