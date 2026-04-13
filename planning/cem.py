@@ -2,23 +2,19 @@
 Cross-Entropy Method (CEM) planner for goal-conditioned control with LeWM.
 
 Uses the frozen LeWM as a latent-space simulator to find action sequences
-that drive the current state toward a goal state. The planner operates
-entirely in latent space — no decoder needed.
+that drive the current state toward a goal state.
 
-Algorithm:
-    1. Encode current and goal observations to latent space.
-    2. Initialize Gaussian action-sequence distribution.
-    3. For each CEM iteration:
-       a. Sample N action sequences from the distribution.
-       b. Roll out each sequence in latent space using the predictor.
-       c. Score each by negative L2 distance of final latent to goal latent.
-       d. Select top-K elite sequences, refit distribution.
-    4. Return the first action of the best (mean) sequence.
+FIX applied vs original:
+  plan() now accepts an optional `z_curr` argument (pre-computed current
+  latent). plan_trajectory() passes the evolved s_curr each step instead
+  of always re-encoding the original `obs` image.  Without this fix the
+  planner optimised actions from the initial latent at every step, making
+  the receding-horizon loop degenerate into an open-loop plan.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -30,7 +26,7 @@ class CEMPlanner:
     """Cross-Entropy Method planner using a frozen LeWM world model.
 
     Args:
-        model: Trained LeWM model (encoder + predictor). Frozen during planning.
+        model:  Trained LeWM model (encoder + predictor). Frozen during planning.
         config: Configuration with CEM hyperparameters.
     """
 
@@ -38,71 +34,77 @@ class CEMPlanner:
         self.model = model
         self.model.eval()
 
-        # CEM hyperparameters
-        self.n_samples = getattr(config, "cem_n_samples", 512)
-        self.top_k = getattr(config, "cem_top_k", 64)
-        self.n_iters = getattr(config, "cem_n_iters", 5)
-        self.horizon = getattr(config, "cem_horizon", 10)
-        self.action_dim = getattr(config, "action_dim", 2)
-        self.action_low = getattr(config, "action_low", -1.0)
-        self.action_high = getattr(config, "action_high", 1.0)
+        self.n_samples = getattr(config, "cem_n_samples",  512)
+        self.top_k = getattr(config, "cem_top_k",       64)
+        self.n_iters = getattr(config, "cem_n_iters",      5)
+        self.horizon = getattr(config, "cem_horizon",     10)
+        self.action_dim = getattr(config, "action_dim",       2)
+        self.action_low = getattr(config, "action_low",      -1.0)
+        self.action_high = getattr(config, "action_high",      1.0)
 
-        # Device
         self.device = next(model.parameters()).device
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Core CEM optimisation
+    # ──────────────────────────────────────────────────────────────────────
+
     @torch.no_grad()
-    def plan(self, obs: torch.Tensor, goal_obs: torch.Tensor) -> np.ndarray:
+    def plan(
+        self,
+        obs: torch.Tensor,
+        goal_obs: torch.Tensor,
+        z_curr: Optional[torch.Tensor] = None,
+        z_goal: Optional[torch.Tensor] = None,
+    ) -> np.ndarray:
         """Plan the next action using CEM.
 
-        Solves for an action sequence that minimizes latent-space distance
-        to the goal, using the LeWM predictor as forward model.
-
         Args:
-            obs: Current observation, shape (3, H, W), normalized.
-            goal_obs: Goal observation, shape (3, H, W), normalized.
+            obs:      Current observation image (3, H, W). Used only if
+                      z_curr is None.
+            goal_obs: Goal observation image (3, H, W). Used only if
+                      z_goal is None.
+            z_curr:   Pre-encoded current latent (1, D). Avoids a redundant
+                      encoder forward pass when called from plan_trajectory.
+            z_goal:   Pre-encoded goal latent (1, D).
 
         Returns:
             First action of the best sequence, shape (action_dim,).
         """
-        N = self.n_samples
-        H = self.horizon
-        K = self.top_k
+        N, H, K = self.n_samples, self.horizon, self.top_k
         device = self.device
 
-        # 1. Encode current and goal observations
-        s_curr = self.model.encode(obs.unsqueeze(0).to(device))    # (1, latent_dim)
-        s_goal = self.model.encode(goal_obs.unsqueeze(0).to(device))  # (1, latent_dim)
+        # Encode only when caller has not already done so.
+        if z_curr is None:
+            z_curr = self.model.encode(obs.unsqueeze(0).to(device))   # (1, D)
+        if z_goal is None:
+            z_goal = self.model.encode(
+                goal_obs.unsqueeze(0).to(device))  # (1, D)
 
-        # 2. Initialize action distribution (zero mean, unit std)
         mu = torch.zeros(H, self.action_dim, device=device)
         std = torch.ones(H, self.action_dim, device=device)
 
-        # 3. CEM optimization loop
-        for iteration in range(self.n_iters):
-            # Sample N action sequences from current distribution
+        for _ in range(self.n_iters):
             noise = torch.randn(N, H, self.action_dim, device=device)
-            actions = mu.unsqueeze(0) + std.unsqueeze(0) * noise  # (N, H, action_dim)
-            actions = actions.clamp(self.action_low, self.action_high)
+            actions = (mu.unsqueeze(0) + std.unsqueeze(0) * noise).clamp(
+                self.action_low, self.action_high
+            )  # (N, H, action_dim)
 
-            # Roll out in latent space
-            s = s_curr.expand(N, -1).clone()  # (N, latent_dim)
+            s = z_curr.expand(N, -1).clone()
             for h in range(H):
-                a_h = actions[:, h, :]  # (N, action_dim)
-                s = self.model.predictor.predict(s, a_h)  # (N, latent_dim)
+                s = self.model.predictor.predict(s, actions[:, h, :])
 
-            # Score: negative L2 distance to goal in latent space
-            scores = -torch.norm(s - s_goal.expand(N, -1), dim=-1)  # (N,)
+            scores = -torch.norm(s - z_goal.expand(N, -1), dim=-1)
+            elite_idx = scores.topk(K).indices
+            elite = actions[elite_idx]
 
-            # Select elite sequences
-            elite_idx = scores.topk(K).indices  # (K,)
-            elite = actions[elite_idx]           # (K, H, action_dim)
+            mu = elite.mean(dim=0)
+            std = elite.std(dim=0) + 1e-5
 
-            # Refit distribution to elite set
-            mu = elite.mean(dim=0)               # (H, action_dim)
-            std = elite.std(dim=0) + 1e-5        # (H, action_dim)
-
-        # 4. Return first action of the best (mean) sequence
         return mu[0].cpu().numpy()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Receding-horizon planning loop
+    # ──────────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def plan_trajectory(
@@ -113,73 +115,66 @@ class CEMPlanner:
         max_steps: int = 100,
         distance_threshold: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Run full receding-horizon planning loop.
+        """Run a full receding-horizon planning loop in latent space.
 
-        At each step: plan → execute first action → simulate next latent state.
-        Since we don't have a real environment, we use the LeWM predictor to
-        simulate the trajectory entirely in latent space.
+        FIX: the original implementation called self.plan(obs, goal_obs)
+        at every step, which re-encoded the *original* obs image each time.
+        This meant CEM always optimised actions from the t=0 latent, making
+        the trajectory simulation in latent space irrelevant.  We now pass
+        the current evolved latent directly into plan() so each CEM call
+        starts from the correct state.
 
         Args:
-            obs: Initial observation, shape (3, H, W), normalized.
-            goal_obs: Goal observation, shape (3, H, W), normalized.
-            dataset: Optional dataset for reference (not used in planning).
-            max_steps: Maximum planning steps (default: 100).
-            distance_threshold: Stop threshold for latent distance.
-                If None, uses 0.1 * ||s_goal||.
+            obs:                Initial observation (3, H, W).
+            goal_obs:           Goal observation (3, H, W).
+            dataset:            Unused — kept for API compatibility.
+            max_steps:          Maximum planning steps.
+            distance_threshold: Latent-distance success criterion.
 
         Returns:
-            Dict with:
-                - 'actions': List of actions taken.
-                - 'latent_distances': List of distances to goal.
-                - 'success': Whether the goal was reached.
-                - 'n_steps': Number of steps taken.
+            Dict with 'actions', 'latent_distances', 'success', 'n_steps',
+            'final_distance'.
         """
         device = self.device
 
-        # Encode initial and goal
-        s_curr = self.model.encode(obs.unsqueeze(0).to(device))
-        s_goal = self.model.encode(goal_obs.unsqueeze(0).to(device))
+        s_curr = self.model.encode(obs.unsqueeze(0).to(device))       # (1, D)
+        s_goal = self.model.encode(goal_obs.unsqueeze(0).to(device))  # (1, D)
 
-        # Compute distance threshold
         if distance_threshold is None:
             goal_norm = torch.norm(s_goal).item()
             distance_threshold = max(0.1 * goal_norm, 0.5)
 
         actions_taken: List[np.ndarray] = []
-        distances: List[float] = []
+        distances:     List[float] = []
 
         for step in range(max_steps):
-            # Compute current distance to goal
             dist = torch.norm(s_curr - s_goal).item()
             distances.append(dist)
 
-            # Check if we've reached the goal
             if dist < distance_threshold:
                 return {
-                    "actions": actions_taken,
+                    "actions":          actions_taken,
                     "latent_distances": distances,
-                    "success": True,
-                    "n_steps": step,
-                    "final_distance": dist,
+                    "success":          True,
+                    "n_steps":          step,
+                    "final_distance":   dist,
                 }
 
-            # Plan next action using CEM (from current latent, not re-encoding)
-            # For receding horizon, we do full CEM from obs
-            action = self.plan(obs, goal_obs)
+            # FIX: pass the current evolved latent so CEM plans from the
+            # correct starting state, not always from encode(original obs).
+            action = self.plan(obs, goal_obs, z_curr=s_curr, z_goal=s_goal)
             actions_taken.append(action)
 
-            # Simulate next state in latent space
             action_t = torch.from_numpy(action).float().unsqueeze(0).to(device)
             s_curr = self.model.predictor.predict(s_curr, action_t)
 
-        # Final distance
         final_dist = torch.norm(s_curr - s_goal).item()
         distances.append(final_dist)
 
         return {
-            "actions": actions_taken,
+            "actions":          actions_taken,
             "latent_distances": distances,
-            "success": final_dist < distance_threshold,
-            "n_steps": max_steps,
-            "final_distance": final_dist,
+            "success":          final_dist < distance_threshold,
+            "n_steps":          max_steps,
+            "final_distance":   final_dist,
         }

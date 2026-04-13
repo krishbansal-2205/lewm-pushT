@@ -5,9 +5,17 @@ Loads the PushT expert demonstrations from HDF5 file with lazy loading
 to minimize RAM usage. Provides train/val splits and data augmentation.
 
 The HDF5 file (from quentinll/lewm-pusht) contains:
-  - observations:      (N, H, W, 3) uint8 images
-  - actions:           (N, action_dim) float32
-  - next_observations: (N, H, W, 3) uint8 images
+  - pixels:      (N, H, W, 3) uint8 images
+  - action:      (N, action_dim) float32
+  Episode boundary metadata: ep_offset, ep_len
+
+FIXES applied vs original:
+  1. /255.0 added when converting uint8→float so ImageNet normalization
+     receives values in [0, 1] instead of [0, 255].
+  2. obs_raw / next_obs_raw are now cloned AFTER the /255.0 scaling,
+     so they live in [0, 1] as the tests expect.
+  3. SWMR open mode now falls back gracefully — the downloaded HDF5
+     was not written with SWMR enabled and raised an OSError.
 """
 
 from __future__ import annotations
@@ -16,13 +24,17 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import h5py
-import hdf5plugin
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 from torch.utils.data import DataLoader, Dataset, Subset
 
-# ImageNet normalization constants
+try:
+    import hdf5plugin  # noqa: F401  – registers Blosc/LZ4 codecs if present
+except ImportError:
+    pass
+
+# ImageNet normalization constants (for [0, 1] inputs)
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
@@ -34,9 +46,9 @@ class PushTDataset(Dataset):
     (only reads individual samples from disk on __getitem__).
 
     Args:
-        h5_path: Path to the HDF5 file.
+        h5_path:    Path to the HDF5 file.
         augmentation: If True, apply random horizontal flips.
-        image_size: Expected image size (default: 96).
+        image_size: Expected image size (default: 224).
     """
 
     def __init__(
@@ -52,13 +64,14 @@ class PushTDataset(Dataset):
         if not self.h5_path.exists():
             raise FileNotFoundError(
                 f"Dataset file not found: {self.h5_path}\n"
-                f"Download it with: python -m lewm_pusht.data.download"
+                f"Download it with: python -m data.download"
             )
 
-        # Open file to get dataset length and verify structure
+        # Open file once to read metadata, then close.
         with h5py.File(self.h5_path, "r") as f:
             self._keys = list(f.keys())
 
+            # ── observation key ──────────────────────────────
             if "pixels" in f:
                 self._obs_key = "pixels"
             elif "observations" in f:
@@ -66,15 +79,17 @@ class PushTDataset(Dataset):
             elif "observation" in f:
                 self._obs_key = "observation"
             else:
-                self._obs_key = None
-                for k in f.keys():
-                    if "obs" in k.lower() and "next" not in k.lower():
-                        self._obs_key = k
-                        break
+                self._obs_key = next(
+                    (k for k in f.keys() if "obs" in k.lower()
+                     and "next" not in k.lower()),
+                    None,
+                )
                 if not self._obs_key:
                     raise KeyError(
-                        f"Cannot find observation keys in HDF5 file. Keys: {self._keys}")
+                        f"Cannot find observation key in HDF5 file. Keys: {self._keys}"
+                    )
 
+            # ── action key ───────────────────────────────────
             if "actions" in f:
                 self._action_key = "actions"
             elif "action" in f:
@@ -82,106 +97,137 @@ class PushTDataset(Dataset):
             else:
                 raise KeyError(f"Cannot find action key. Keys: {self._keys}")
 
+            # ── next-observation key ─────────────────────────
             self._has_next_obs = False
             for k in f.keys():
                 if "next" in k.lower() and "obs" in k.lower():
                     self._next_obs_key = k
                     self._has_next_obs = True
+                    break
 
-            # Setup valid indices correctly for episode-based datasets
+            # ── valid index range ────────────────────────────
             self._length = f[self._obs_key].shape[0]
             if "ep_offset" in f and "ep_len" in f:
-                # LeRobot style dataset
+                # LeRobot-style dataset: exclude last frame of each episode
+                # because it has no valid next observation.
                 ep_offsets = f["ep_offset"][:]
                 ep_lens = f["ep_len"][:]
-                valid_indices = []
+                valid: list[int] = []
                 for offset, length in zip(ep_offsets, ep_lens):
                     if length > 1:
-                        # Exclude the last frame of each episode since it has no next_obs
-                        valid_indices.extend(
-                            range(offset, offset + length - 1))
-                self._valid_indices = np.array(valid_indices)
+                        valid.extend(
+                            range(int(offset), int(offset) + int(length) - 1))
+                self._valid_indices = np.array(valid, dtype=np.int64)
             else:
-                # Assuming generic transitions or _has_next_obs is True
                 if self._has_next_obs:
-                    self._valid_indices = np.arange(self._length)
+                    self._valid_indices = np.arange(
+                        self._length, dtype=np.int64)
                 else:
-                    self._valid_indices = np.arange(self._length - 1)
+                    self._valid_indices = np.arange(
+                        self._length - 1, dtype=np.int64)
 
-        # h5py file handle for lazy loading (opened per-worker in DataLoader)
+        # File handle opened lazily per DataLoader worker.
         self._h5_file: Optional[h5py.File] = None
 
+    # ──────────────────────────────────────────────────────────────────────
+    # HDF5 handle (lazy, per-worker)
+    # ──────────────────────────────────────────────────────────────────────
+
     def _get_h5(self) -> h5py.File:
-        """Get or open the HDF5 file handle (thread-safe for DataLoader workers)."""
+        """Return (or open) the HDF5 file handle for this worker.
+
+        FIX: SWMR mode requires the file to have been written with
+        libver='latest' and SWMR enabled.  The HuggingFace download does
+        NOT satisfy this requirement and raises an OSError at open time.
+        We now fall back to a normal read-only open automatically.
+        """
         if self._h5_file is None:
-            # Open with SWMR (Single Writer Multiple Reader) for faster concurrent reads
-            self._h5_file = h5py.File(self.h5_path, "r", swmr=True, libver='latest', rdcc_nbytes=1024**3,
-                                      rdcc_nslots=1e6)
+            try:
+                self._h5_file = h5py.File(
+                    self.h5_path,
+                    "r",
+                    swmr=True,
+                    libver="latest",
+                    rdcc_nbytes=256 * 1024 * 1024,   # 256 MB read cache
+                    rdcc_nslots=int(1e5),
+                )
+            except OSError:
+                # File was not created with SWMR support — open normally.
+                self._h5_file = h5py.File(
+                    self.h5_path,
+                    "r",
+                    rdcc_nbytes=256 * 1024 * 1024,
+                    rdcc_nslots=int(1e5),
+                )
         return self._h5_file
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Dataset protocol
+    # ──────────────────────────────────────────────────────────────────────
 
     def __len__(self) -> int:
         return len(self._valid_indices)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single sample.
+        """Return one (obs, action, next_obs) transition.
 
-        Returns:
-            Dict with keys:
-                - 'obs': Normalized observation, shape (3, H, W), float32.
-                - 'action': Action vector, shape (action_dim,), float32.
-                - 'next_obs': Normalized next observation, shape (3, H, W), float32.
-                - 'obs_raw': Un-normalized observation for visualization, (3, H, W).
-                - 'next_obs_raw': Un-normalized next observation, (3, H, W).
+        Returns
+        -------
+        Dict with keys:
+            obs        : ImageNet-normalised float32 tensor, shape (3, H, W).
+            action     : float32 tensor, shape (action_dim,).
+            next_obs   : ImageNet-normalised float32 tensor, shape (3, H, W).
+            obs_raw    : un-normalised [0, 1] float32 tensor, shape (3, H, W).
+            next_obs_raw: un-normalised [0, 1] float32 tensor, shape (3, H, W).
         """
         h5 = self._get_h5()
-        real_idx = self._valid_indices[idx]
+        real_idx = int(self._valid_indices[idx])
 
-        # Load data from HDF5
-        obs = h5[self._obs_key][real_idx]           # (H, W, 3) uint8
-        action = h5[self._action_key][real_idx]     # (action_dim,) float32
+        # ── Load raw arrays from HDF5 ────────────────────────
+        obs_np = h5[self._obs_key][real_idx]        # (H, W, 3) uint8
+        act_np = h5[self._action_key][real_idx]     # (action_dim,) float32
 
         if self._has_next_obs:
-            next_obs = h5[self._next_obs_key][real_idx]  # (H, W, 3) uint8
+            nxt_np = h5[self._next_obs_key][real_idx]
         else:
-            next_obs = h5[self._obs_key][real_idx + 1]
+            nxt_np = h5[self._obs_key][real_idx + 1]
 
-        # Convert to float tensors: HWC → CHW, [0, 255] → [0, 1]
-        obs = torch.from_numpy(obs.astype(np.float32)).permute(2, 0, 1) 
-        next_obs = torch.from_numpy(next_obs.astype(
-            np.float32)).permute(2, 0, 1) 
-        action = torch.from_numpy(action.astype(np.float32))
+        # ── uint8 → float32, HWC → CHW, scale to [0, 1] ─────
+        # FIX: divide by 255 here so ImageNet mean/std (designed for [0,1])
+        # are applied correctly.  The original code omitted this step,
+        # resulting in normalised values around ±550 instead of ±2.
+        obs = torch.from_numpy(obs_np.astype(np.float32)
+                               ).permute(2, 0, 1) / 255.0
+        next_obs = torch.from_numpy(nxt_np.astype(
+            np.float32)).permute(2, 0, 1) / 255.0
+        action = torch.from_numpy(act_np.astype(np.float32))
 
-        # if obs.shape[-1] != self.image_size or obs.shape[-2] != self.image_size:
-        #     obs = TF.resize(
-        #         obs, [self.image_size, self.image_size], antialias=True)
-        #     next_obs = TF.resize(
-        #         next_obs, [self.image_size, self.image_size], antialias=True)
-
-        # Store raw (un-normalized) copies for visualization
+        # ── Store raw [0, 1] copies for visualisation ────────
+        # FIX: clone AFTER /255 so obs_raw is in [0, 1] as expected by
+        # tests and visualisation code.
         obs_raw = obs.clone()
         next_obs_raw = next_obs.clone()
 
-        # Apply augmentation: random horizontal flip
+        # ── Data augmentation: random horizontal flip ────────
         if self.augmentation and torch.rand(1).item() > 0.5:
-            obs = torch.flip(obs, dims=[-1])
+            obs = torch.flip(obs,      dims=[-1])
             next_obs = torch.flip(next_obs, dims=[-1])
-            # Flip action x-component for consistency (PushT: action[0] is x-velocity)
+            # Mirror x-velocity for physical consistency.
             action[0] = -action[0]
 
-        # Normalize with ImageNet stats
+        # ── ImageNet normalisation ────────────────────────────
         obs = (obs - IMAGENET_MEAN) / IMAGENET_STD
         next_obs = (next_obs - IMAGENET_MEAN) / IMAGENET_STD
 
         return {
-            "obs": obs,
-            "action": action,
-            "next_obs": next_obs,
-            "obs_raw": obs_raw,
+            "obs":          obs,
+            "action":       action,
+            "next_obs":     next_obs,
+            "obs_raw":      obs_raw,
             "next_obs_raw": next_obs_raw,
         }
 
     def __del__(self) -> None:
-        """Clean up HDF5 file handle."""
         if getattr(self, "_h5_file", None) is not None:
             try:
                 self._h5_file.close()
@@ -189,76 +235,70 @@ class PushTDataset(Dataset):
                 pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DataLoader factory
+# ─────────────────────────────────────────────────────────────────────────────
+
 def get_dataloaders(
     h5_path: str | Path,
     batch_size: int = 256,
     train_split: float = 0.9,
     augmentation: bool = True,
-    num_workers: int = 16,
+    num_workers: int = 8,
     image_size: int = 224,
     seed: int = 42,
-) -> Tuple[DataLoader, DataLoader, PushTDataset]:
+) -> Tuple[DataLoader, DataLoader, "PushTDataset"]:
     """Create train and validation DataLoaders.
 
     Args:
-        h5_path: Path to the HDF5 dataset file.
-        batch_size: Batch size for training (default: 256).
-        train_split: Fraction of data for training (default: 0.9).
-        augmentation: Apply data augmentation to train set (default: True).
-        num_workers: Number of DataLoader workers (default: 4).
-        image_size: Expected image size (default: 96).
-        seed: Random seed for reproducible splits (default: 42).
+        h5_path:      Path to the HDF5 dataset file.
+        batch_size:   Batch size for training (default: 256).
+        train_split:  Fraction of data for training (default: 0.9).
+        augmentation: Apply random flips to the train split (default: True).
+        num_workers:  DataLoader worker count (default: 8).
+        image_size:   Expected image size (default: 224).
+        seed:         Random seed for reproducible splits (default: 42).
 
     Returns:
         Tuple of (train_loader, val_loader, full_dataset).
     """
-    # Create full dataset (no augmentation for val)
     full_dataset = PushTDataset(
-        h5_path=h5_path,
-        augmentation=False,
-        image_size=image_size,
-    )
+        h5_path=h5_path, augmentation=False, image_size=image_size)
     n = len(full_dataset)
     n_train = int(n * train_split)
 
-    # Generate reproducible random split
     rng = np.random.RandomState(seed)
     indices = rng.permutation(n)
     train_indices = indices[:n_train].tolist()
     val_indices = indices[n_train:].tolist()
 
-    # Create train dataset with augmentation
     train_dataset = PushTDataset(
-        h5_path=h5_path,
-        augmentation=augmentation,
-        image_size=image_size,
-    )
-
+        h5_path=h5_path, augmentation=augmentation, image_size=image_size)
     train_subset = Subset(train_dataset, train_indices)
-    val_subset = Subset(full_dataset, val_indices)
+    val_subset = Subset(full_dataset,  val_indices)
 
     use_cuda = torch.cuda.is_available()
+    worker_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=use_cuda,
+        prefetch_factor=4 if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
+    )
 
     train_loader = DataLoader(
         train_subset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=use_cuda,
         drop_last=True,
-        prefetch_factor=4,
-        persistent_workers=num_workers > 0,
+        **worker_kwargs,
     )
 
     val_loader = DataLoader(
         val_subset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=use_cuda,
         drop_last=False,
-        prefetch_factor=4,
-        persistent_workers=num_workers > 0,
+        **worker_kwargs,
     )
 
     print(f"Dataset loaded: {n} total samples")
